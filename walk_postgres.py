@@ -3,13 +3,15 @@
 # Port of V1's postgresdb_discovery and table_level_schema_generator (ds_discover_worker.py), on the
 # library's psycopg2 connection instead of a SQLAlchemy engine:
 #   key      schema.table                       path  the schema        host  the connection's host
-#   bytes    pg_total_relation_size: the table with its indexes and TOAST; a partitioned table, its partitions'
+#   bytes    pg_table_size: the table and its TOAST, which is what scan reads, not its indexes (architect
+#            2026-47-01, ruling 2); a partitioned table, its partitions'
 #   rows     pg_class.reltuples, the planner's count as of the last ANALYZE; null when never analysed
 #   schema   {"columns": [...], "constraints": [...]}: the columns, and the primary, unique and foreign keys
 #   source   {"scan_sql": ...}: V1's SELECT of the table's columns, bytea left out, 200 columns at most,
 #            identifiers quoted for PostgreSQL (V1 wrote SQL Server's brackets)
 #   owners   the table's owner and its schema's owner, as roles
-#   units    schemas, by name
+#   units    schemas, by name. A schema the connecting role has no USAGE on is one unlisted place, and none
+#            of its tables is handed in (architect 2026-47-01, 3.1). A table without SELECT is handed in.
 #
 # Only the catalogue is read: no row of a customer's table. The session is autocommit and read-only, every
 # statement has DS_DISCOVER_STATEMENT_SEC, a lock is waited for 5 seconds at most (a size function waits
@@ -56,12 +58,13 @@ def _is_link_error(exc):
 
 
 class SchemaUnit(dd.Unit):
-    __slots__ = ("oid", "owner")
+    __slots__ = ("oid", "owner", "usable")
 
-    def __init__(self, oid, name, owner):
+    def __init__(self, oid, name, owner, usable=True):
         super().__init__(name)
         self.oid = oid
         self.owner = owner
+        self.usable = usable
 
 
 class Session(object):
@@ -242,14 +245,15 @@ class PostgresWalker(dd.Walker):
         scope = self.ctx.scope
         self.schemas = self._list_value(scope, "schemas")
         self.tables = self._list_value(scope, "tables")
-        sql = ("select n.oid, n.nspname, r.rolname from pg_namespace n left join pg_roles r on r.oid = n.nspowner "
+        sql = ("select n.oid, n.nspname, r.rolname, has_schema_privilege(n.oid, 'USAGE') "
+               "from pg_namespace n left join pg_roles r on r.oid = n.nspowner "
                "where n.nspname not like 'pg\\_%%' and n.nspname <> all(%s)")
         args = [list(SYSTEM_SCHEMAS)]
         if self.schemas:
             sql += " and n.nspname = any(%s)"
             args.append(self.schemas)
         rows = self._with_link(lambda: self.query(sql + " order by n.nspname", args))
-        units = [SchemaUnit(oid, name, owner) for oid, name, owner in rows]
+        units = [SchemaUnit(oid, name, owner, usable) for oid, name, owner, usable in rows]
         if self.tables:
             # a schema with none of the filter's tables is not a unit
             candidates = sorted({t for t in self.tables} | {t.partition(".")[2] for t in self.tables if "." in t})
@@ -273,6 +277,10 @@ class PostgresWalker(dd.Walker):
 
     # ---- one schema
     def walk_unit(self, unit):
+        if not unit.usable:
+            # its tables could only fail in scan, every run: one line for the administrator instead
+            self.unlisted_schema(unit, "permission denied")
+            return
         names = self.tables_for(unit.id)
         after = ""
         tries = 0
@@ -359,14 +367,14 @@ class PostgresWalker(dd.Walker):
         return out
 
     def sizes(self, oids, partitioned):
-        """pg_total_relation_size for each table; for a partitioned table, the sum over its partitions.
+        """pg_table_size for each table; for a partitioned table, the sum over its partitions.
         A table whose lock can't be had in LOCK_TIMEOUT_MS is sized alone, and gets null if it still can't."""
         tree = ("with recursive t(top, oid) as (select x, x from unnest(%s::oid[]) x "
                 "union all select t.top, i.inhrelid from t join pg_inherits i on i.inhparent = t.oid) ")
         try:
-            got = dict(self.query("select x, pg_total_relation_size(x) from unnest(%s::oid[]) x", (oids,)))
+            got = dict(self.query("select x, pg_table_size(x) from unnest(%s::oid[]) x", (oids,)))
             if partitioned:
-                got.update(dict(self.query(tree + "select top, sum(pg_total_relation_size(oid))::bigint from t "
+                got.update(dict(self.query(tree + "select top, sum(pg_table_size(oid))::bigint from t "
                                            "group by top", (partitioned,))))
         except Exception as e:
             if _sqlstate(e) != "55P03":
@@ -375,9 +383,9 @@ class PostgresWalker(dd.Walker):
             for oid in oids:
                 try:
                     if oid in partitioned:
-                        r = self.query(tree + "select sum(pg_total_relation_size(oid))::bigint from t", ([oid],))
+                        r = self.query(tree + "select sum(pg_table_size(oid))::bigint from t", ([oid],))
                     else:
-                        r = self.query("select pg_total_relation_size(%s::oid)", (oid,))
+                        r = self.query("select pg_table_size(%s::oid)", (oid,))
                     got[oid] = r[0][0]
                 except Exception as e2:
                     if _sqlstate(e2) != "55P03":

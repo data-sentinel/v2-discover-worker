@@ -4,9 +4,12 @@ FROM python:3.13-slim-trixie
 ARG DS_UID=10001
 ARG DS_GID=10001
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+# Who it is, as the conductor's image sets its own three. 5600 until the workers' ports are assigned.
+ENV DS_SERVICE=ds_discover \
+    DS_SERVICE_EXTERNAL_HOST=ds_discover \
+    DS_SERVICE_EXTERNAL_PORT=5600 \
     PYTHONUNBUFFERED=1 \
-    DS_SERVICE_EXTERNAL_PORT=5600
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
@@ -23,7 +26,7 @@ USER ${DS_UID}:${DS_GID}
 
 EXPOSE 5600
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('DS_SERVICE_PORT', os.environ.get('DS_SERVICE_EXTERNAL_PORT', '5600')) + '/health', timeout=4)" || exit 1
+  CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('DS_SERVICE_EXTERNAL_PORT', '5600') + '/health', timeout=4)" || exit 1
 STOPSIGNAL SIGTERM
 
 CMD ["python", "main.py"]

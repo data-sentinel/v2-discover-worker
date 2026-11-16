@@ -9,11 +9,12 @@
 #   units    each include path's own files, and each top folder under it, by path
 #   owners   the file's owner and group and its folder's owner, as V1 resolves them, LDAP left out
 #
-# Nothing is opened: folders are listed and entries lstat'ed, so no file's access time moves. Links,
-# devices, sockets and pipes are not handed in. A folder the account can't list is tried again twice and
-# then handed in as unlisted. Calls that touch the share run on a helper thread with a time limit, so a
+# Nothing is opened: folders are listed and entries stat'ed, so no file's access time moves. Links,
+# devices, sockets and pipes are not handed in. A folder the account may not enter is handed in as unlisted
+# at once; one that timed out or lost its connection is tried twice more first. Calls that touch the share run on a helper thread with a time limit, so a
 # share that stops answering can't hold the walk past a stop or past DS_DISCOVER_STATEMENT_SEC.
 import base64
+import ctypes
 import errno
 import grp
 import os
@@ -34,9 +35,15 @@ PLACE_TRIES = 3                     # a folder that can't be listed: tried this 
 PLACE_RETRY_DELAYS = (2.0, 5.0)     # seconds before the second and the third try
 SMB_FSTYPES = {"cifs", "smb3", "smbfs"}
 SHARE_NOTE = "mounted share: os owner is the mount mapping, not the NTFS owner"
-# errors that say the share itself may be gone, not just one folder: the source is checked at once
-LINK_ERRNOS = {errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.ETIMEDOUT, errno.EHOSTDOWN, errno.EHOSTUNREACH,
-               errno.ENODEV, errno.ECONNRESET, errno.ECONNABORTED, errno.ENETUNREACH, errno.ENETDOWN}
+# what another try can pass: a dropped connection, a busy share. A timeout too (ShareTimeout). Not a
+# permission denied, which is an unlisted place at once (architect 2026-47-01, 3.4)
+RETRY_ERRNOS = {errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.ETIMEDOUT, errno.EHOSTDOWN, errno.EHOSTUNREACH,
+                errno.ENODEV, errno.ECONNRESET, errno.ECONNABORTED, errno.ENETUNREACH, errno.ENETDOWN,
+                errno.EBUSY, errno.EAGAIN, errno.EINTR}
+
+
+def retryable(exc):
+    return isinstance(exc, ShareTimeout) or getattr(exc, "errno", None) in RETRY_ERRNOS
 
 
 # ------------------------------------------------------------------------------------------------
@@ -236,6 +243,74 @@ def utc(ts):
 
 
 # ------------------------------------------------------------------------------------------------
+# a file's stat, with its birth time: statx(2) through the C library, no compiled extension
+# ------------------------------------------------------------------------------------------------
+class _StatxTimestamp(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_int64), ("tv_nsec", ctypes.c_uint32), ("_reserved", ctypes.c_int32)]
+
+
+class _Statx(ctypes.Structure):
+    # struct statx as the kernel defines it (include/uapi/linux/stat.h): 256 bytes
+    _fields_ = [("stx_mask", ctypes.c_uint32), ("stx_blksize", ctypes.c_uint32), ("stx_attributes", ctypes.c_uint64),
+                ("stx_nlink", ctypes.c_uint32), ("stx_uid", ctypes.c_uint32), ("stx_gid", ctypes.c_uint32),
+                ("stx_mode", ctypes.c_uint16), ("_spare0", ctypes.c_uint16), ("stx_ino", ctypes.c_uint64),
+                ("stx_size", ctypes.c_uint64), ("stx_blocks", ctypes.c_uint64), ("stx_attributes_mask", ctypes.c_uint64),
+                ("stx_atime", _StatxTimestamp), ("stx_btime", _StatxTimestamp), ("stx_ctime", _StatxTimestamp),
+                ("stx_mtime", _StatxTimestamp), ("stx_rdev_major", ctypes.c_uint32), ("stx_rdev_minor", ctypes.c_uint32),
+                ("stx_dev_major", ctypes.c_uint32), ("stx_dev_minor", ctypes.c_uint32), ("_spare", ctypes.c_uint64 * 14)]
+
+
+AT_FDCWD = -100
+AT_SYMLINK_NOFOLLOW = 0x100
+AT_NO_AUTOMOUNT = 0x800
+STATX_BASIC_STATS = 0x7FF
+STATX_BTIME = 0x800
+
+
+def _load_statx():
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).statx
+    except (OSError, AttributeError):
+        return None                     # a C library without statx (glibc before 2.28): lstat, no birth time
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.POINTER(_Statx)]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_statx = _load_statx()
+
+
+class FileStat(object):
+    """What the walk keeps of a file's stat. birth is None where the file system reports no birth time."""
+    __slots__ = ("size", "uid", "gid", "atime", "mtime", "birth")
+
+    def __init__(self, size, uid, gid, atime, mtime, birth):
+        self.size, self.uid, self.gid, self.atime, self.mtime, self.birth = size, uid, gid, atime, mtime, birth
+
+
+def _ts(t):
+    return t.tv_sec + t.tv_nsec / 1e9
+
+
+def file_stat(path):
+    """statx with the birth time asked for, not following a link; os.lstat (and no birth time) where the C
+    library or the kernel has no statx. Raises OSError as lstat would."""
+    global _statx
+    if _statx is not None:
+        buf = _Statx()
+        if _statx(AT_FDCWD, os.fsencode(path), AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+                  STATX_BASIC_STATS | STATX_BTIME, ctypes.byref(buf)) == 0:
+            birth = _ts(buf.stx_btime) if buf.stx_mask & STATX_BTIME else None
+            return FileStat(buf.stx_size, buf.stx_uid, buf.stx_gid, _ts(buf.stx_atime), _ts(buf.stx_mtime), birth)
+        err = ctypes.get_errno()
+        if err != errno.ENOSYS:
+            raise OSError(err, os.strerror(err))
+        _statx = None                   # a kernel (or a seccomp profile) without statx: lstat from here on
+    st = os.lstat(path)
+    return FileStat(st.st_size, st.st_uid, st.st_gid, st.st_atime, st.st_mtime, None)
+
+
+# ------------------------------------------------------------------------------------------------
 # calls that touch the share, on a helper thread with a limit
 # ------------------------------------------------------------------------------------------------
 class ShareTimeout(Exception):
@@ -283,7 +358,7 @@ def _open_folder(real, want_sid):
 
 
 def _read_page(it, want_sid):
-    """Up to PAGE entries: (name, kind, lstat or None, error or None, owner SID or None)."""
+    """Up to PAGE entries: (name, kind, FileStat or None, error or None, owner SID or None)."""
     out = []
     for entry in it:
         st = err = sid = None
@@ -302,7 +377,7 @@ def _read_page(it, want_sid):
             kind, err = "file", e
         if kind == "file" and err is None:
             try:
-                st = entry.stat(follow_symlinks=False)
+                st = file_stat(entry.path)
             except FileNotFoundError:
                 kind = "gone"
             except OSError as e:
@@ -570,11 +645,14 @@ class DirectoryWalker(dd.Walker):
             except dd.WalkStopped:
                 raise
             except (OSError, ShareTimeout) as e:
-                if isinstance(e, (FileNotFoundError, NotADirectoryError, ShareTimeout)) or \
-                        getattr(e, "errno", None) in LINK_ERRNOS:
-                    self.check_source()
-                    if isinstance(e, (FileNotFoundError, NotADirectoryError)):
-                        continue            # the source is there and this folder isn't: it was removed
+                # the source first: a share that went away, or a root that can't be listed any more, is a
+                # release with the check's code, never a run of unlisted places
+                self.check_source()
+                if isinstance(e, (FileNotFoundError, NotADirectoryError)):
+                    continue                # the source is there and this folder isn't: it was removed
+                if not retryable(e):
+                    self.unlisted_folder(rel, e)        # permission denied: another try can't pass
+                    continue
                 n = tries.get(rel, 0) + 1
                 tries[rel] = n
                 if n < PLACE_TRIES:
@@ -637,15 +715,16 @@ class DirectoryWalker(dd.Walker):
 
     def element(self, rel, name, path, st, sid, on_share, dir_owner, odd):
         if st is not None:
-            owners = merge_owners(self.owners.owner(st.st_uid, sid, on_share, "file.owner"),
-                                  self.owners.group_entry(st.st_gid, on_share, "file.group"), dir_owner)
-            size, ctime, mtime, atime = st.st_size, utc(st.st_ctime), utc(st.st_mtime), utc(st.st_atime)
+            owners = merge_owners(self.owners.owner(st.uid, sid, on_share, "file.owner"),
+                                  self.owners.group_entry(st.gid, on_share, "file.group"), dir_owner)
+            # created_at is the birth time, or null: never the inode's change time (architect 2026-47-01, 3.2)
+            size, born, mtime, atime = st.size, utc(st.birth), utc(st.mtime), utc(st.atime)
         else:
             owners = merge_owners(dir_owner)
-            size = ctime = mtime = atime = None             # listed, and the source wouldn't say more
+            size = born = mtime = atime = None              # listed, and the source wouldn't say more
         el = {"key": shown(rel) if odd else rel, "parent_key": None, "host": "directory", "path": path,
               "name": shown(name) if odd else name, "obj_type": "document", "obj_subtype": "filesystem",
-              "bytes": size, "rows": None, "created_at": ctime, "modified_at": mtime, "accessed_at": atime,
+              "bytes": size, "rows": None, "created_at": born, "modified_at": mtime, "accessed_at": atime,
               "owners": owners, "to_scan": True, "source": {}, "schema": None, "metadata": {}}
         if odd:
             el["source"] = {"path_b64": base64.b64encode(rel.encode("utf-8", "surrogateescape")).decode("ascii")}

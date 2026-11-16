@@ -19,7 +19,8 @@
 #      the walks           walk_directory.py, walk_postgres.py, ... (one module a family)
 #
 #__version__ = '2026.47.1'   # first hand-off: the service, the queue half, the hand-in, directory and postgres (steps 2-7)
-__version__ = '2026.47.1'
+#__version__ = '2026.47.2'   # architect 2026-47-01 (unlisted schemas, birth times, no retry on permission denied, the run's count); settings read as the conductor reads them
+__version__ = '2026.47.2'
 
 import asyncio
 import json
@@ -43,7 +44,6 @@ WORKER_TYPE = "discover"
 STAGE = "discover"
 
 RENEW_SEC = 30               # the contract: renew every 30 seconds
-HEARTBEAT_SEC = 30           # the standard: heartbeat every 30 seconds
 CONTRACT_SEC = 60            # the standard: contract checked every 60 seconds
 CONTRACT_AFTER_BREAK = (5, 15, 30)
 RECONNECT_MAX_SEC = 30
@@ -68,20 +68,25 @@ class SettingsError(Exception):
         self.why = why
 
 
-def _read_v1_secret(secrets_dir, name):
-    """V1's secret files: <dir>/<name> holding {"<name>": value}. None when absent or unreadable."""
+def _secret_text(path, name=None):
+    """A secret file's value, as the conductor reads it: the platform's files hold {"<name>": "<value>"};
+    a file that isn't that is taken as it is, with the line end removed."""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    key = name or os.path.basename(path)
     try:
-        with open(os.path.join(secrets_dir, name), "r", encoding="utf-8") as f:
-            return json.load(f)[name]
-    except Exception:
-        return None
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and key in obj:
+            return str(obj[key])
+    except ValueError:
+        pass
+    return raw.strip("\r\n")
 
 
 def read_database_password(path):
-    """The database password: a Docker secret mounted as a file and read as it is (a trailing
-    line break dropped). Read at every connect, so a rotated secret is picked up by the next one."""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().rstrip("\r\n")
+    """The database password: a Docker secret mounted as a file and read as it is. Read at every connect,
+    so a rotated secret is picked up by the next one."""
+    return _secret_text(path)
 
 
 class Settings(object):
@@ -111,42 +116,65 @@ class Settings(object):
                 raise SettingsError(name, "must be from " + str(lo) + " to " + str(hi))
             return v
 
-        self.service = text("DS_SERVICE", required=True)
+        # Who it is, and the repository database: the same names, defaults, secret files and checks as the
+        # conductor (WORKER-STANDARD; the conductor's Settings, 2026.47.3). An environment variable wins over
+        # the secret file; the files are looked for in DS_SECRETS_DIR.
+        self.service = text("DS_SERVICE", "ds_discover")
         self.address = text("DS_SERVICE_EXTERNAL_HOST", self.service)
         self.port = integer("DS_SERVICE_EXTERNAL_PORT", 5600, 1, 65535)
-        self.listen_port = integer("DS_SERVICE_PORT", self.port, 1, 65535)
-
         self.secrets_dir = text("DS_SECRETS_DIR", "/run/secrets")
-        self.db_host = text("DS_DB_HOST") or _read_v1_secret(self.secrets_dir, "repository_host")
-        if not self.db_host:
-            raise SettingsError("DS_DB_HOST", "is required (or the repository_host secret)")
-        port_default = _read_v1_secret(self.secrets_dir, "repository_port") or 5432
-        try:
-            port_default = int(port_default)
-        except (TypeError, ValueError):
-            raise SettingsError("repository_port", "must be a whole number")
-        self.db_port = integer("DS_DB_PORT", port_default, 1, 65535)
-        self.db_name = text("DS_DB_NAME") or _read_v1_secret(self.secrets_dir, "repository_name") or "data_sentinel"
-        self.db_user = text("DS_DB_USER") or _read_v1_secret(self.secrets_dir, "repository_username") or "sentinel_worker"
-        self.db_password_file = text("DS_DB_PASSWORD_FILE", "/run/secrets/sentinel_worker_password")
+
+        def repository(env_name, secret_name, default=None):
+            v = text(env_name)
+            if v is not None:
+                return v
+            path = os.path.join(self.secrets_dir, secret_name)
+            if os.path.isfile(path):
+                try:
+                    v = _secret_text(path, secret_name).strip()
+                except OSError as exc:
+                    raise SettingsError(secret_name, "the secret file " + path + " can't be read ("
+                                        + type(exc).__name__ + ")")
+                if v:
+                    return v
+            if default is None:
+                raise SettingsError(env_name, "not set, and there is no secret file " + path)
+            return default
+
+        self.db_host = repository("DS_DB_HOST", "repository_host")
+        port = repository("DS_DB_PORT", "repository_port", "5432")
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise SettingsError("DS_DB_PORT", "'" + port + "' (or the repository_port secret) is not a port number")
+        self.db_port = int(port)
+        self.db_name = repository("DS_DB_NAME", "repository_name", "data_sentinel")
+        self.db_user = repository("DS_DB_USER", "repository_username", "sentinel_worker")
+        self.db_password_file = text("DS_DB_PASSWORD_FILE", os.path.join(self.secrets_dir, "sentinel_worker_password"))
+        if not os.path.isfile(self.db_password_file):
+            raise SettingsError("DS_DB_PASSWORD_FILE", "there is no file " + self.db_password_file)
         try:
             read_database_password(self.db_password_file)
-        except OSError:
-            raise SettingsError("DS_DB_PASSWORD_FILE", "can't be read")
+        except OSError as exc:
+            raise SettingsError("DS_DB_PASSWORD_FILE", self.db_password_file + " can't be read ("
+                                + type(exc).__name__ + ")")
+        self.heartbeat_sec = integer("DS_HEARTBEAT_SEC", 30, 1, 110)    # online means a heartbeat under 2 minutes old
 
         self.log_dir = text("DS_LOG_DIR", "/mnt/logs")
         self.log_level = (text("DS_LOG_LEVEL", "info") or "info").lower()
         if self.log_level not in ("debug", "info", "warning", "error"):
             raise SettingsError("DS_LOG_LEVEL", "must be debug, info, warning or error")
 
-        roots = text("DS_FILE_ROOTS", "")
-        self.file_roots = [r for r in (roots.split(":") if roots else []) if r.strip()]
-
+        # Connecting to data sources: as the conductor reads them
+        self.file_roots = [r for r in (p.strip() for p in (text("DS_FILE_ROOTS", "") or "").split(":")) if r]
+        for r in self.file_roots:
+            if not os.path.isabs(r):
+                raise SettingsError("DS_FILE_ROOTS", "'" + r + "' is not an absolute path")
         self.ca_bundle = text("DS_CA_BUNDLE")
         if self.ca_bundle and not os.path.isfile(self.ca_bundle):
-            raise SettingsError("DS_CA_BUNDLE", "is not a file")
-        self.https_proxy = text("HTTPS_PROXY")
-        self.no_proxy = text("NO_PROXY", "")
+            raise SettingsError("DS_CA_BUNDLE", "there is no file " + self.ca_bundle)
+        self.https_proxy = text("HTTPS_PROXY") or text("https_proxy")
+        if self.https_proxy and "://" not in self.https_proxy:
+            raise SettingsError("HTTPS_PROXY", "'" + self.https_proxy + "' is not a URL")
+        self.no_proxy = text("NO_PROXY") or text("no_proxy") or ""
 
         self.batch = integer("DS_DISCOVER_BATCH", 10000, 1, 10000)
         self.flush_sec = integer("DS_DISCOVER_FLUSH_SEC", 300, 1, 3600)
@@ -302,8 +330,9 @@ REASONS_WHEN = {
     "unexpected": "a release as retry for the worker's own fault: an exception inside a walk (its class is the "
                   "reason, never its text), or a fault it found, such as run_block_without_filter, "
                   "connection_v1_shaped, walk_incomplete, secret_in_checkpoint, objects_invalid",
-    "place_unlisted": "on an element handed in with unlisted: a folder or a schema it found and couldn't list, "
-                      "after three tries. reason is a few words (permission denied, timed out), never a path",
+    "place_unlisted": "on an element handed in with unlisted: a folder or a schema it found and couldn't list. At "
+                      "once for a permission denied; after three tries for a timeout or a lost connection. reason "
+                      "is a few words (permission denied, timed out), never a path",
     "data_source_inactive": "a release as retry: sys_get_data_source_connection answered data_source_inactive",
     "type_not_walked": "a release as retry: the run's data source is of a type this image has no walk for",
     "path_outside_root_path": "a release as retry: a directory filter's include path is inside the file roots "
@@ -758,7 +787,8 @@ class HandIn(object):
 
     A batch is always the front of the buffer, so a parent emitted before its child is handed in
     in the same batch or an earlier one. A unit is finished when its end has been seen and its last
-    element is in a stored batch; the checkpoint is the last unit before the first unfinished one."""
+    element is in a stored batch; the checkpoint is the last unit before the first unfinished one,
+    with the number of elements the run has handed in up to it, so a resumed claim counts the run."""
 
     def __init__(self, buffer_max, by, inherited_checkpoint=None):
         self.cv = threading.Condition()
@@ -779,7 +809,9 @@ class HandIn(object):
         self.inherited = inherited_checkpoint
         self.checkpoint = None          # the newest low-water mark of this attempt
         self.checkpoint_sent = None
-        self.handed_in = 0
+        self.handed_in = 0              # stored by this claim
+        self.base_handed_in = 0         # handed in up to the inherited checkpoint's mark, by earlier claims
+        self.done_objects = 0           # elements of this claim's finished units
         self.last_activity = time.monotonic()
 
     # ---- set up
@@ -787,6 +819,8 @@ class HandIn(object):
         with self.cv:
             self.units = list(units)
             self.skipped = skipped
+            n = self.inherited.get("handed_in") if skipped and isinstance(self.inherited, dict) else None
+            self.base_handed_in = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
 
     # ---- walk threads
     def emit(self, element, unit_index):
@@ -841,8 +875,10 @@ class HandIn(object):
                 break
             self.low_water += 1
             self.ticked.append(i)
+            self.done_objects += self.unit_objects.get(i, 0)
         if self.low_water > 0:
-            self.checkpoint = {"v": 1, "by": self.by, "done_through": self.units[self.low_water - 1].id}
+            self.checkpoint = {"v": 1, "by": self.by, "done_through": self.units[self.low_water - 1].id,
+                               "handed_in": self.base_handed_in + self.done_objects}
 
     def take_ticked(self):
         with self.cv:
@@ -872,7 +908,8 @@ class HandIn(object):
     def counts(self):
         with self.cv:
             total = self.skipped + len(self.units)
-            return {"units_total": total, "units_done": self.skipped + self.low_water, "handed_in": self.handed_in}
+            return {"units_total": total, "units_done": self.skipped + self.low_water,
+                    "handed_in": self.base_handed_in + self.handed_in}
 
     def all_finished(self):
         with self.cv:
@@ -894,7 +931,7 @@ def resume_skip(units, checkpoint, by):
 # =====================================================================================
 # 8. The claim: one queue, from claim to complete or release
 # =====================================================================================
-FILTER_KEYS = ("scope_snapshot", "filter", "filter_snapshot")
+FILTER_KEYS = ("scope_snapshot",)      # the run block as built (architect 2026-47-01)
 _STOP_RANK = {"sigterm": 1, "paused": 2, "stopped": 3, "cancelled": 4, "lost": 9}
 
 
@@ -1583,7 +1620,7 @@ class Service(object):
         self._heartbeat_due = 0.0
 
     async def _heartbeat(self, again=True):
-        self._heartbeat_due = time.monotonic() + HEARTBEAT_SEC
+        self._heartbeat_due = time.monotonic() + self.s.heartbeat_sec
         if self.worker_id is None:
             return
         use_health = "sys_post_worker_heartbeat.v_health" in self.contract["optional"]
@@ -1775,7 +1812,7 @@ def main():
     try:
         settings = Settings()
     except SettingsError as e:
-        print(time.strftime("%Y-%m-%d %H:%M:%S") + "|ERROR|discover settings " + e.variable + " " + e.why, flush=True)
+        print(time.strftime("%Y-%m-%d %H:%M:%S") + "|ERROR|discover settings " + e.variable + ": " + e.why, flush=True)
         os._exit(2)
     setup_logging(settings)
 
@@ -1806,7 +1843,7 @@ def main():
                 asyncio.ensure_future(wind())
             loop.call_soon_threadsafe(begin)
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=settings.listen_port, log_level="warning",
+    config = uvicorn.Config(app, host="0.0.0.0", port=settings.port, log_level="warning",
                             access_log=False, lifespan="on")
     server = Server(config)
 
