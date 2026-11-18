@@ -2,7 +2,8 @@
 #
 # Walks a data source and hands in what it finds, for one run's discovery queue at a time.
 # Built to WORKER-STANDARD 2026-46-06 (conductor 2026.47.3) and to the queue worker
-# contract (architect 2026-46-71). Signs in only through ds_connect_lib.
+# contract (architect 2026-46-71), as architect 2026-47-29 changes it: the worker takes its work. An idle
+# worker asks the database for a queue of its type; nothing calls it. Signs in only through ds_connect_lib.
 #
 # Layout of this file
 #   1  settings            one Settings class, read once; a value that can't be used exits 2
@@ -13,19 +14,21 @@
 #   6  walkers             the interface each source type's walk implements, and the registry
 #   7  the hand-in buffer  batches, parents first, and the low-water checkpoint
 #   8  the claim           one queue: renew, walk, hand in, then complete or release
-#   9  the service         check-in, heartbeat, contract checks, reconnects, resume
-#  10  endpoints           /health /ready /status /run /stop
+#   9  the service         check-in, heartbeat, contract checks, reconnects, resume, the idle loop
+#  10  endpoints           /health /ready /status
 #  11  main                uvicorn, SIGTERM
 #      the walks           walk_directory.py, walk_postgres.py, ... (one module a family)
 #
 #__version__ = '2026.47.1'   # first hand-off: the service, the queue half, the hand-in, directory and postgres (steps 2-7)
 #__version__ = '2026.47.2'   # architect 2026-47-01 (unlisted schemas, birth times, no retry on permission denied, the run's count); settings read as the conductor reads them
-__version__ = '2026.47.2'
+#__version__ = '2026.47.3'   # architect 2026-47-29: the worker takes its work (sys_post_partition_claim_next); no /run, no /stop
+__version__ = '2026.47.3'
 
 import asyncio
 import json
 import logging
 import os
+import random
 import signal
 import ssl
 import sys
@@ -36,7 +39,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 import asyncpg
-from quart import Quart, jsonify, request
+from quart import Quart, jsonify
 
 import ds_connect_lib as dcl
 
@@ -48,8 +51,8 @@ CONTRACT_SEC = 60            # the standard: contract checked every 60 seconds
 CONTRACT_AFTER_BREAK = (5, 15, 30)
 RECONNECT_MAX_SEC = 30
 PING_SEC = 5
-RECONCILE_SEC = 60           # an idle worker asks what it holds, so a claim whose answer was lost is picked up
-CLAIM_CALL_SEC = 4.0         # /run answers within 5 seconds
+CLAIM_CALL_SEC = 10.0        # one ask for work (sys_post_partition_claim_next)
+POLL_JITTER = 0.2            # each wait between asks varies by up to a fifth either way (architect 2026-47-29)
 SIGTERM_GRACE_SEC = 30       # the standard: running work gets up to 30 seconds
 HANDIN_CALL_SEC = 180
 HANDIN_REFUSALS_MAX = 3      # an unknown refusal of a hand-in, three times running, is the worker's fault
@@ -157,6 +160,7 @@ class Settings(object):
             raise SettingsError("DS_DB_PASSWORD_FILE", self.db_password_file + " can't be read ("
                                 + type(exc).__name__ + ")")
         self.heartbeat_sec = integer("DS_HEARTBEAT_SEC", 30, 1, 110)    # online means a heartbeat under 2 minutes old
+        self.poll_sec = integer("DS_POLL_SEC", 5, 1, 60)    # an idle worker asks for its queue this often (2026-47-29)
 
         self.log_dir = text("DS_LOG_DIR", "/mnt/logs")
         self.log_level = (text("DS_LOG_LEVEL", "info") or "info").lower()
@@ -209,7 +213,7 @@ class Settings(object):
                 + " threads=" + str(self.threads or "per_type") + " statement_sec=" + str(self.statement_sec)
                 + " buffer_max=" + str(self.buffer_max) + " ca_bundle=" + ("yes" if self.ca_bundle else "no")
                 + " proxy=" + ("yes" if self.https_proxy else "no")
-                + " owner_map=" + ("yes" if self.owner_map_file else "no"))
+                + " owner_map=" + ("yes" if self.owner_map_file else "no") + " poll_sec=" + str(self.poll_sec))
 
     def proxy(self):
         if not self.https_proxy:
@@ -334,7 +338,8 @@ REASONS_WHEN = {
                       "once for a permission denied; after three tries for a timeout or a lost connection. reason "
                       "is a few words (permission denied, timed out), never a path",
     "data_source_inactive": "a release as retry: sys_get_data_source_connection answered data_source_inactive",
-    "type_not_walked": "a release as retry: the run's data source is of a type this image has no walk for",
+    "type_not_walked": "a release as retry: a queue held from before (a resume) whose data source is of a type "
+                       "this image has no walk for. sys_post_partition_claim_next never offers one",
     "path_outside_root_path": "a release as retry: a directory filter's include path is inside the file roots "
                               "but not under the data source's root_path",
 }
@@ -579,7 +584,7 @@ CONTRACT_BASE = {
 }
 CONTRACT_JOB = {
     "sys_get_data_source_connection": ("v_data_source_id",),
-    "sys_post_partition_claim": ("v_run_id", "v_stage", "v_partition_id", "v_worker_id"),
+    "sys_post_partition_claim_next": ("v_worker_id",),
     "sys_post_partition_renew": ("v_run_id", "v_stage", "v_partition_id", "v_worker_id", "v_attempt",
                                  "v_progress", "v_checkpoint"),
     "sys_post_partition_complete": ("v_run_id", "v_stage", "v_partition_id", "v_worker_id", "v_attempt",
@@ -1452,7 +1457,10 @@ class Service(object):
         self._extra_checks = []
         self._heartbeat_due = 0.0
         self._ping_due = 0.0
-        self._reconcile_due = 0.0
+        self._reconcile_due = None      # set when what it holds must be read again (a lost answer, worker_busy)
+        self._ask_task = None
+        self._asking = False            # the contract check has passed since the link last came up
+        self.last_ask = None
         self._broke_at = None
         self._exit_hook = None
 
@@ -1493,7 +1501,7 @@ class Service(object):
             work = health_item("working", {"stage": c.stage, "run_id": c.run_id})
         return {"ready": self.ready, "problem": problem, "work": work,
                 "detail": {"queue": c.block() if c else None,
-                           "last_heartbeat": self.last_heartbeat}}
+                           "last_heartbeat": self.last_heartbeat, "last_ask": self.last_ask}}
 
     def status(self):
         return {
@@ -1501,7 +1509,7 @@ class Service(object):
                        "connect_lib": dcl.__version__, "status": self.status_word,
                        "started_at": self.started_at.isoformat(), "step": self.ready_step(),
                        "types": walkable_types()},
-            "database": {"connected": self.db.connected, "listening": False, "lock": None,
+            "database": {"connected": self.db.connected, "listening": False, "lock": None, "last_ask": self.last_ask,
                          "contract": {"ok": self.contract["job"], "missing": self.contract["missing"]},
                          "last_heartbeat": self.last_heartbeat, "health_sent": self.health_sent},
             "queue": self.claim.block() if self.claim else None,
@@ -1535,6 +1543,7 @@ class Service(object):
         log.info("discover start " + kv(version=__version__, connect=dcl.__version__,
                                         python=sys.version.split()[0]) + " " + self.s.describe())
         self._task = asyncio.create_task(self._supervise())
+        self._ask_task = asyncio.create_task(self._ask_loop())
 
     async def _supervise(self):
         backoff = 1.0
@@ -1542,6 +1551,7 @@ class Service(object):
         while self.fatal_reason is None:
             try:
                 if not self.db.connected:
+                    self._asking = False
                     self.step = "connecting" if first else "reconnecting"
                     try:
                         await self.db.connect()
@@ -1568,10 +1578,10 @@ class Service(object):
                 if now >= self._ping_due:
                     self._ping_due = now + PING_SEC
                     await self.db.ping()
-                if (now >= self._reconcile_due and self.contract["job"] and self.worker_id is not None
-                        and self.claim is None and not self.stopping):
-                    self._reconcile_due = now + RECONCILE_SEC
+                if (self._reconcile_due is not None and now >= self._reconcile_due and self.contract["job"]
+                        and self.worker_id is not None and self.claim is None and not self.stopping):
                     await self._reconcile()
+                    self._reconcile_due = None      # only once read: a link that broke meanwhile reads it again
             except NotService:
                 self.fatal("not_service")
                 return
@@ -1605,6 +1615,7 @@ class Service(object):
         changed = missing != self.contract["missing"] or self.contract["checked_at"] is None
         self.contract.update(base=base, job=job, missing=missing, optional=optional,
                              checked_at=datetime.now(timezone.utc).isoformat())
+        self._asking = bool(job)
         if changed:
             if missing:
                 log.error(kv(discover="contract_missing", n=len(missing)) + " missing=" + ",".join(missing))
@@ -1675,53 +1686,72 @@ class Service(object):
         c.task = asyncio.create_task(c.run())
         return c
 
-    # ---- the queue endpoints
-    async def run_request(self, body):
-        if not self.ready:
-            return 503, {"claimed": False, "why": "not_ready"}
-        try:
-            run_id = int(body["run_id"])
-            stage = str(body["stage"])
-            partition_id = int(body.get("partition_id", 1))
-        except (KeyError, TypeError, ValueError):
-            return 400, {"claimed": False, "why": "bad_request"}
-        if stage != STAGE:
-            return 400, {"claimed": False, "why": "wrong_stage"}
-        if self.claim is not None or self.claim_lock.locked():
-            return 409, {"claimed": False, "why": "busy"}
-        async with self.claim_lock:
-            if self.claim is not None:
-                return 409, {"claimed": False, "why": "busy"}
-            try:
-                ans = await self.db.call("sys_post_partition_claim", timeout=CLAIM_CALL_SEC, v_run_id=run_id,
-                                         v_stage=stage, v_partition_id=partition_id, v_worker_id=self.worker_id)
-            except DbGone:
-                self._reconcile_due = 0.0                    # if the claim went through, the next look finds it
-                self.wake()
-                return 503, {"claimed": False, "why": "not_ready"}
-            except DbRefusal as r:
-                return 409, {"claimed": False, "why": r.hint or r.sqlstate}
-            if not isinstance(ans, dict) or not ans.get("claimed"):
-                return 409, {"claimed": False, "why": (ans or {}).get("why", "refused") if isinstance(ans, dict) else "refused"}
-            attempt = int(ans.get("attempt", 1))
-            self._start_claim(run_id, stage, partition_id, attempt, ans.get("run") or {})
-            return 200, {"claimed": True, "attempt": attempt}
+    # ---- the idle loop: a worker takes its work (architect 2026-47-29; Kevin, 17 November)
+    def can_ask(self):
+        """Ready, its holdings read since it started, the contract check passed since the link came up, no queue
+        held or being taken, not winding down."""
+        return (self.ready and self.read_work and self._asking and self.claim is None
+                and not self.claim_lock.locked() and self._reconcile_due is None)
 
-    async def stop_request(self, body):
-        c = self.claim
-        try:
-            same = (c is not None and int(body["run_id"]) == c.run_id and str(body["stage"]) == c.stage
-                    and int(body.get("partition_id", 1)) == c.partition_id)
-        except (KeyError, TypeError, ValueError):
-            same = False
-        if not same:
-            return 404, {"held": False}
-        why = body.get("why")
-        if why == "expired":
-            c.mark_lost("expired")
-        else:
-            c.renew_wake.set()                               # renew now; the answer decides
-        return 202, {"held": True}
+    async def _ask_loop(self):
+        while self.fatal_reason is None and not self.stopping:
+            wait = self.s.poll_sec * random.uniform(1.0 - POLL_JITTER, 1.0 + POLL_JITTER)
+            await asyncio.sleep(wait)
+            if not self.can_ask():
+                continue
+            try:
+                await self.ask()
+            except NotService:
+                self.fatal("not_service")
+                return
+            except Exception as e:
+                log.error(kv(discover="ask", where=where(e)))
+
+    async def ask(self):
+        """One ask for a queue of this worker's type. True when one was taken."""
+        async with self.claim_lock:
+            if self.claim is not None or self.stopping:
+                return False
+            try:
+                ans = await self.db.call("sys_post_partition_claim_next", timeout=CLAIM_CALL_SEC,
+                                         v_worker_id=self.worker_id)
+            except DbGone:
+                # the claim may have gone through with its answer lost: read what it holds once the link is back
+                self._reconcile_due = 0.0
+                self.wake()
+                return False
+            except DbRefusal as r:
+                self.last_ask = datetime.now(timezone.utc).isoformat()
+                if r.hint == "worker_not_found":
+                    log.warning(kv(discover="worker_not_found"))
+                    self.worker_id = None                    # the supervisor checks in again
+                    self.wake()
+                else:
+                    log.warning(kv(discover="ask_refused", sqlstate=r.sqlstate, hint=r.hint or "-"))
+                return False
+            self.last_ask = datetime.now(timezone.utc).isoformat()
+            if not isinstance(ans, dict):
+                log.warning(kv(discover="ask_answer", kind=type(ans).__name__))
+                return False
+            if ans.get("claimed"):
+                try:
+                    run_id, stage = int(ans["run_id"]), str(ans["stage"])
+                    partition_id, attempt = int(ans.get("partition_id", 1)), int(ans["attempt"])
+                except (KeyError, TypeError, ValueError):
+                    log.error(kv(discover="ask_answer", kind="claimed_without_ids"))
+                    self._reconcile_due = 0.0
+                    return False
+                if stage != STAGE:
+                    log.warning(kv(discover="held_other_stage", run=run_id, stage=stage))
+                    return False
+                log.info(kv(discover="claimed", run=run_id, attempt=attempt))
+                self._start_claim(run_id, stage, partition_id, attempt, ans.get("run") or {})
+                return True
+            if ans.get("why") == "worker_busy":
+                self._reconcile_due = 0.0                    # it holds something it doesn't know about
+                self.wake()
+            # nothing_on_offer, worker_not_ready: the normal answers, thousands a day: no log line
+            return False
 
     # ---- SIGTERM
     async def shutdown(self):
@@ -1743,6 +1773,8 @@ class Service(object):
                 await asyncio.wait_for(asyncio.shield(c.task), SIGTERM_GRACE_SEC + 2)
             except Exception:
                 pass
+        if self._ask_task is not None:
+            self._ask_task.cancel()
         if self._task is not None:
             self._task.cancel()
         await self.db.close()
@@ -1790,18 +1822,8 @@ def create_app(settings):
     async def status():
         return jsonify(svc.status()), 200
 
-    @app.post("/run")
-    async def run():
-        body = await request.get_json(force=True, silent=True) or {}
-        code, answer = await svc.run_request(body)
-        return jsonify(answer), code
-
-    @app.post("/stop")
-    async def stop():
-        body = await request.get_json(force=True, silent=True) or {}
-        code, answer = await svc.stop_request(body)
-        return jsonify(answer), code
-
+    # Nothing calls a worker (architect 2026-47-29): no /run, no /stop. It asks for its queue, and a stop
+    # reaches it at its next renewal.
     return app
 
 
